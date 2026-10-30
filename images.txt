@@ -3,3 +3,4 @@ openwebui/open-webui:0.12.0
 openwebui/open-webui:0.12.1
 openwebui/open-webui:0.12.2
 openwebui/open-webui:0.12.3
+openwebui/open-webui:0.12.5
