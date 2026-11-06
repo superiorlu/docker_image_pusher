@@ -3,6 +3,7 @@
 Registry queries are the external boundary; selection and naming use real code.
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -183,6 +184,147 @@ class RegistrySelectionTest(unittest.TestCase):
                     self.module.main(root / 'images.txt')
             self.assertFalse((root / 'selected').exists())
             self.assertFalse((root / 'output').exists())
+
+
+class DigestSyncTest(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('digest_sync', SCRIPT)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.leaf = json.dumps({'schemaVersion': 2,
+            'config': {'digest': 'sha256:config'}, 'layers': []}).encode()
+        self.digest = 'sha256:' + hashlib.sha256(self.leaf).hexdigest()
+
+    def result(self, raw, code=0, error=b''):
+        return subprocess.CompletedProcess([], code, raw, error)
+
+    def test_manifest_digest_uses_exact_registry_bytes(self):
+        raw = self.leaf + b'\n'
+        with mock.patch.object(self.module.subprocess, 'run', return_value=self.result(raw)) as run:
+            found = self.module.read_manifest('team/app:v1')
+        self.assertEqual(found['digest'], 'sha256:' + hashlib.sha256(raw).hexdigest())
+        self.assertNotIn('text', run.call_args.kwargs)
+
+    def test_index_resolves_amd64_not_arm64_or_attestation(self):
+        index = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': 'sha256:arm', 'platform': {'os': 'linux', 'architecture': 'arm64'}},
+            {'digest': self.digest, 'platform': {'os': 'linux', 'architecture': 'amd64'}},
+            {'digest': 'sha256:attestation', 'platform': {'os': 'unknown', 'architecture': 'unknown'}},
+        ]}).encode()
+        with mock.patch.object(self.module.subprocess, 'run', side_effect=[
+                self.result(index), self.result(self.leaf),
+                self.result(b'{"os":"linux","architecture":"amd64"}')]) as run:
+            found = self.module.resolve_manifest('ghcr.io/team/app:v1', 'linux/amd64',
+                                                  verify_platform=True)
+        self.assertEqual(found['digest'], self.digest)
+        self.assertEqual(run.call_args_list[1].args[0][4], 'ghcr.io/team/app@' + self.digest)
+
+    def test_wrong_descriptor_digest_or_leaf_platform_is_rejected(self):
+        index = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': 'sha256:' + '0' * 64,
+             'platform': {'os': 'linux', 'architecture': 'amd64'}}]}).encode()
+        with mock.patch.object(self.module.subprocess, 'run', side_effect=[
+                self.result(index), self.result(self.leaf)]), self.assertRaises(RuntimeError):
+            self.module.resolve_manifest('team/app:v1', 'linux/amd64')
+        with mock.patch.object(self.module.subprocess, 'run', side_effect=[
+                self.result(self.leaf), self.result(b'{"os":"linux","architecture":"arm64"}')
+                ]), self.assertRaises(RuntimeError):
+            self.module.resolve_manifest('team/app:v1', 'linux/amd64', verify_platform=True)
+
+    def test_missing_platform_is_sync_for_target_but_error_for_source(self):
+        index = json.dumps({'schemaVersion': 2, 'manifests': [
+            {'digest': 'sha256:arm', 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode()
+        with mock.patch.object(self.module.subprocess, 'run', return_value=self.result(index)):
+            self.assertIsNone(self.module.resolve_manifest('acr/team/app:v1', 'linux/amd64',
+                                                           missing_ok=True))
+            with self.assertRaises(RuntimeError):
+                self.module.resolve_manifest('team/app:v1', 'linux/amd64')
+
+    def test_only_explicit_target_missing_is_recoverable(self):
+        for error in [b'manifest unknown', b'ERROR: team/app:v1: not found']:
+            with self.subTest(error=error), mock.patch.object(self.module.subprocess, 'run',
+                    return_value=self.result(b'', 1, error)):
+                self.assertIsNone(self.module.read_manifest('team/app:v1', missing_ok=True))
+                with self.assertRaises(RuntimeError):
+                    self.module.read_manifest('team/app:v1')
+        for error in [b'401 Unauthorized', b'403 Forbidden', b'429 Too Many Requests',
+                      b'TLS handshake timeout', b'500 server error', b'error: token endpoint: 404 Not Found']:
+            with self.subTest(error=error), mock.patch.object(self.module.subprocess, 'run',
+                    return_value=self.result(b'', 1, error)), self.assertRaises(RuntimeError):
+                self.module.read_manifest('team/app:v1', missing_ok=True)
+
+    def test_equal_platform_digest_skips_and_changed_or_missing_targets_sync(self):
+        def resolve(ref, platform, **kwargs):
+            self.assertEqual(platform, 'linux/amd64')
+            if ref.startswith(REGISTRY):
+                return (None if '/missing:' in ref else
+                        {'digest': 'sha256:old' if '/changed:' in ref else self.digest})
+            self.assertTrue(kwargs['verify_platform'])
+            return {'digest': self.digest}
+        with mock.patch.object(self.module, 'resolve_manifest', side_effect=resolve):
+            selected, skipped = self.module.plan_digest_sync(
+                ['team/equal:v1', 'team/changed:v1', 'team/missing:v1'], REGISTRY, NAMESPACE)
+        self.assertEqual([item['reason'] for item in selected], ['changed', 'missing'])
+        self.assertEqual(skipped[0]['reason'], 'equal')
+        self.assertEqual(selected[0]['pinned_source'], 'team/changed@' + self.digest)
+
+    def test_manual_filter_naming_and_force_resolve_source_snapshot(self):
+        with mock.patch.object(self.module, 'resolve_manifest', return_value={'digest': self.digest}) as resolve:
+            selected, skipped = self.module.plan_digest_sync(['alice/app:v1', 'bob/app:v1'],
+                REGISTRY, NAMESPACE, requested='bob/app:v1')
+            self.assertEqual(skipped[0]['destination'], REGISTRY + '/hub518/bob_app:v1')
+            selected, skipped = self.module.plan_digest_sync(['team/app:v1'], REGISTRY,
+                NAMESPACE, force_all=True)
+            self.assertEqual(selected[0]['reason'], 'force')
+            self.assertTrue(selected[0]['pinned_source'].endswith(self.digest))
+            self.assertEqual(resolve.call_count, 3)
+
+    def test_digest_pinning_preserves_registry_ports(self):
+        for source, expected in [('localhost:5000/team/app:v1', 'localhost:5000/team/app'),
+                                 ('team/app:v1@sha256:old', 'team/app'), ('ubuntu', 'ubuntu')]:
+            self.assertEqual(self.module.pin_reference(source, self.digest), expected + '@' + self.digest)
+
+    def test_plan_is_published_only_after_all_comparisons_succeed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'images').write_text('team/one:v1\nteam/two:v1\n')
+            env = {'ALIYUN_REGISTRY': REGISTRY, 'ALIYUN_NAME_SPACE': NAMESPACE,
+                   'INPUT_IMAGES': '', 'INPUT_SYNC_ALL': 'false',
+                   'SYNC_PLAN_FILE': str(root / 'plan'), 'GITHUB_OUTPUT': str(root / 'output')}
+            with mock.patch.dict(os.environ, env), mock.patch.object(self.module, 'resolve_manifest',
+                    side_effect=[{'digest': self.digest}, None, RuntimeError('auth failed')]):
+                with self.assertRaises(RuntimeError):
+                    self.module.digest_main(root / 'images')
+            self.assertFalse((root / 'plan').exists())
+            self.assertFalse((root / 'output').exists())
+            with mock.patch.dict(os.environ, env), mock.patch.object(self.module, 'resolve_manifest',
+                    side_effect=[{'digest': self.digest}, None, {'digest': self.digest}, {'digest': self.digest}]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.module.digest_main(root / 'images')
+            self.assertEqual(len(json.loads((root / 'plan').read_text())['selected']), 1)
+            self.assertEqual((root / 'output').read_text(), 'count=1\nskipped=1\n')
+
+    def test_copy_preserves_pinned_digest_then_verifies_target(self):
+        item = {'source': 'team/app:v1', 'pinned_source': 'team/app@' + self.digest,
+                'source_digest': self.digest, 'destination': REGISTRY + '/hub518/app:v1',
+                'platform': 'linux/amd64', 'reason': 'changed'}
+        with tempfile.TemporaryDirectory() as temp:
+            plan = Path(temp) / 'plan'
+            plan.write_text(json.dumps({'selected': [item]}))
+            with mock.patch.dict(os.environ, {'DOCKER_CONFIG': temp}), \
+                    mock.patch.object(self.module.subprocess, 'run') as run, \
+                    mock.patch.object(self.module, 'resolve_manifest', return_value={'digest': self.digest}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.module.sync_plan(plan)
+            command = run.call_args.args[0]
+            self.assertIn('--preserve-digests', command)
+            self.assertEqual(command[-2:], ['docker://' + item['pinned_source'],
+                                            'docker://' + item['destination']])
+            self.assertIn(str(Path(temp) / 'config.json'), command)
+            with mock.patch.object(self.module.subprocess, 'run'), mock.patch.object(self.module,
+                    'resolve_manifest', return_value={'digest': 'sha256:different'}), \
+                    self.assertRaises(RuntimeError), contextlib.redirect_stdout(io.StringIO()):
+                self.module.sync_plan(plan)
 
 
 if __name__ == '__main__':
