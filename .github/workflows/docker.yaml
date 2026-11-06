@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       sync_all:
-        description: 'Force re-sync ALL images, including existing ACR tags'
+        description: 'Force re-sync ALL images, even when platform digests match'
         required: false
         default: false
         type: boolean
@@ -23,7 +23,7 @@ env:
 
 jobs:
   build:
-    name: Pull
+    name: Sync
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
@@ -39,44 +39,25 @@ jobs:
       run: |
         printf '%s' "$ALIYUN_REGISTRY_PASSWORD" | docker login --username "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
 
-    - name: Select missing images in ACR
+    - name: Compare source and ACR platform digests
       id: select
       env:
         INPUT_IMAGES: ${{ inputs.images }}
         INPUT_SYNC_ALL: ${{ inputs.sync_all }}
-        SELECTED_IMAGES_FILE: ${{ runner.temp }}/selected-images.tsv
-      run: python3 .github/scripts/select_missing_images.py
+        SYNC_PLAN_FILE: ${{ runner.temp }}/sync-plan.json
+      run: python3 .github/scripts/select_missing_images.py --compare-digests
 
-    - name: Free disk space for selected images
+    - name: Install Skopeo for digest-preserving copy
       if: steps.select.outputs.count != '0'
       run: |
-        df -hT
-        # Keep space on root for Docker and containerd. Clean only when needed.
-        available_kb=$(df -Pk / | awk 'NR==2 {print $4}')
-        if (( available_kb < 20 * 1024 * 1024 )); then
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+        if ! command -v skopeo >/dev/null 2>&1; then
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y skopeo
         fi
-        df -hT
+        skopeo --version
 
-    - name: Build and push image Aliyun
+    - name: Copy changed images and verify ACR digests
       if: steps.select.outputs.count != '0'
       env:
-        SELECTED_IMAGES_FILE: ${{ runner.temp }}/selected-images.tsv
-      run: |
-        while IFS=$'\t' read -r line new_image || [ -n "$line" ]; do
-          # The planner supplies the exact same destination it checked in ACR.
-          read -r -a pull_args <<< "$line"
-          image="${pull_args[${#pull_args[@]}-1]}"
-          echo "docker pull $line"
-          docker pull "${pull_args[@]}"
-          docker tag "$image" "$new_image"
-          docker push "$new_image"
-          echo "::group::Verify pushed manifest"
-          docker image inspect "$image" --format '{{.Os}}/{{.Architecture}} image_id={{.Id}}'
-          docker buildx imagetools inspect "$new_image"
-          docker buildx imagetools inspect "$new_image" --raw
-          echo "::endgroup::"
-          docker rmi "$image"
-          docker rmi "$new_image"
-          df -hT
-        done < "$SELECTED_IMAGES_FILE"
+        SYNC_PLAN_FILE: ${{ runner.temp }}/sync-plan.json
+      run: python3 .github/scripts/select_missing_images.py --sync-plan
