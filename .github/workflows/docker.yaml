@@ -204,7 +204,7 @@ jobs:
             echo "docker push $new_image"
             docker push $new_image
             echo "::group::Verify pushed manifest"
-            docker image inspect "$image" --format '{{.Os}}/{{.Architecture}} config={{.Id}}'
+            docker image inspect "$image" --format '{{.Os}}/{{.Architecture}} image_id={{.Id}}'
             docker buildx imagetools inspect "$new_image"
             docker buildx imagetools inspect "$new_image" --raw
             echo "::endgroup::"
