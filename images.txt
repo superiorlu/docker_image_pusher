@@ -5,3 +5,4 @@ openwebui/open-webui:0.12.2
 openwebui/open-webui:0.12.3
 openwebui/open-webui:0.12.5
 gitlab/gitlab-runner:alpine-v19.5.0
+ghcr.io/cirruslabs/flutter:3.41.7
